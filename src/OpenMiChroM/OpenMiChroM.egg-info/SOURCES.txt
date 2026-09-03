@@ -1,0 +1,17 @@
+LICENSE
+MANIFEST.in
+README.rst
+setup.py
+OpenMiChroM/ChromDynamics.py
+OpenMiChroM/CndbTools.py
+OpenMiChroM/CustomReporter.py
+OpenMiChroM/Integrators.py
+OpenMiChroM/Optimization.py
+OpenMiChroM/__init__.py
+OpenMiChroM.egg-info/PKG-INFO
+OpenMiChroM.egg-info/SOURCES.txt
+OpenMiChroM.egg-info/dependency_links.txt
+OpenMiChroM.egg-info/not-zip-safe
+OpenMiChroM.egg-info/requires.txt
+OpenMiChroM.egg-info/top_level.txt
+OpenMiChroM/share/MiChroM.ff

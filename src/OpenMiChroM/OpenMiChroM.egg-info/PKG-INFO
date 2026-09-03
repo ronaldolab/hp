@@ -1,0 +1,22 @@
+Metadata-Version: 2.4
+Name: OpenMiChroM
+Version: 1.1.1
+Summary: Open-MiChroM library for chromosome simulations
+Home-page: https://ndb.rice.edu/Open-MiChroM
+Author: Antonio Bento de Oliveira Junior, Vinicius de Godoi Contessoto
+Author-email: antonio.oliveira@rice.edu, contessoto@rice.edu
+Requires-Python: >=3.9
+License-File: LICENSE
+Requires-Dist: numpy
+Requires-Dist: scipy
+Requires-Dist: scikit-learn
+Requires-Dist: h5py
+Requires-Dist: pandas
+Requires-Dist: openmm
+Dynamic: author
+Dynamic: author-email
+Dynamic: home-page
+Dynamic: license-file
+Dynamic: requires-dist
+Dynamic: requires-python
+Dynamic: summary
