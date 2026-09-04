@@ -1,8 +1,8 @@
-"""HP chromosome-simulation workflows using OpenMiChroM 1.1.1.
+"""Homopolymer (HP) chromosome-simulation workflows.
 
-This module consolidates the equilibration, expansion, and capsule
-workflows.  It deliberately preserves their force parameters and block counts;
-only the OpenMiChroM 1.1.1 keyword names have been updated.
+This module consolidates the equilibration, expansion, and capsule workflows. It deliberately preserves their force parameters and block counts from the paper. Only the OpenMiChroM 1.1.1 keyword names have been updated.
+
+The HP simulation workflows use mostly OpenMiChroM 1.1.1 and OpenMM 8.3.1.
 """
 
 from __future__ import annotations
@@ -16,9 +16,7 @@ from typing import Literal
 
 import numpy as np
 
-# The package source lives in ``src/OpenMiChroM/OpenMiChroM`` so that its
-# setup.py remains self-contained.  Make that package root precede the outer
-# directory when this module is run directly from ``src``.
+# The package source lives in ``src/OpenMiChroM/OpenMiChroM`` so that its setup.py remains self-contained. Make that package root precede the outer directory when this module is run directly from ``src``.
 _OPENMICROM_SOURCE_ROOT = Path(__file__).resolve().parent / "OpenMiChroM"
 if (_OPENMICROM_SOURCE_ROOT / "OpenMiChroM" / "__init__.py").is_file():
     sys.path.insert(0, str(_OPENMICROM_SOURCE_ROOT))
@@ -39,7 +37,7 @@ class HPConfig:
     output_folder: Path
     chrom_sequence: Path
     model: Model = "knotted"
-    platform: str = "OpenCL"
+    platform: str = "CPU"
     blocks: int = 1000 #3000
     time_step: float = 0.01
     equilibration_time: int = 5000
@@ -47,7 +45,7 @@ class HPConfig:
     types_table_dir: Path | None = None
     capsule_radius: float | None = None
     capsule_force_constant: float = 30.0
-    sphere_radius: float | None = None
+    sphere_radius: float = 20.0
 
     collapse_blocks: int = 200
     production_blocks: int = 200
@@ -66,18 +64,16 @@ class HP:
     """Run one HP simulation workflow.
 
     Available modes are ``collapse``, ``equilibration``, ``production``,
-    ``all_at_once``, ``expansion``, ``untie``, ``capsule-collapse``, and
-    ``sphere-collapse``.
-    ``all_at_once`` runs collapse, equilibration, and production in sequence.
+    ``all_at_once``, ``sphere_all_at_once``, ``expansion``, ``untie``,
+    and ``capsule-collapse``. The two ``*_all_at_once`` workflows run collapse,
+    equilibration, and production in sequence.
     """
 
     config: HPConfig
     radius_of_gyration: list[float] = field(default_factory=list, init=False)
 
     def __post_init__(self) -> None:
-        # OpenMiChroM prefixes explicit structure filenames with its output
-        # folder.  Keep this path absolute so a relative folder is not added
-        # twice when those filenames are generated.
+        # OpenMiChroM prefixes explicit structure filenames with its output folder. Keep this path absolute so a relative folder is not added twice when those filenames are generated.
         self.config.output_folder = Path(self.config.output_folder).expanduser().resolve()
         self.config.chrom_sequence = Path(self.config.chrom_sequence)
         if self.config.model not in {"knotted", "unknotted"}:
@@ -375,9 +371,7 @@ class HP:
     def capsule_collapse(self) -> MiChroM:
         """Collapse into the shrinking capsule, then run production.
 
-        The capsule radius follows the existing exponential schedule from 21.2
-        to 10.4, stopping the relaxation once the configured target radius is
-        reached.  No units or schedule values are changed here.
+        The capsule radius follows the existing exponential schedule from 21.2 to 10.4, stopping the relaxation once the configured target radius is reached. No units or schedule values are changed here.
         """
         target_radius = self._require_capsule_radius()
         simulation = self._new_simulation("3.capsule_collapse", temperature=1.0)
@@ -418,14 +412,15 @@ class HP:
         simulation.saveStructure(mode="gro")
         return simulation
 
-    def sphere_collapse(self) -> MiChroM:
-        """Run the hot-expansion and spherical-collapse protocol.
+    def sphere_all_at_once(self) -> MiChroM:
+        """Run the spherical collapse, equilibration, and production workflow.
 
-        The protocol starts from a spring spiral, expands for 500 blocks at
-        ``T = 3.0``, compresses from radius 600.0 using the exponential
-        schedule, and then equilibrates with type-to-type interactions.  The
-        sphere radius and every numerical schedule parameter remain in the
-        OpenMiChroM units used by the archived sphere protocol.
+        The first stage starts from a spring spiral, expands for 500 blocks at
+        ``T = 3.0``, and compresses from radius 600.0 using the existing
+        exponential schedule. After removing spherical confinement, the model
+        equilibrates with type-to-type interactions and then performs the
+        standard production length. The sphere radius and all schedule
+        parameters remain in the OpenMiChroM units used by this protocol.
         """
         target_radius = self._require_sphere_radius()
         if not self.config.chrom_sequence.is_file():
@@ -439,7 +434,10 @@ class HP:
         self._add_polymer_forces(
             simulation,
             repulsive_cutoff=self._repulsive_cutoff,
-            ideal_chromosome=True,
+            # The ideal-chromosome term is part of the unknotted model only.
+            # The knotted branch retains the same spherical-collapse schedule
+            # without this lengthwise interaction.
+            ideal_chromosome=(self.config.model == "unknotted"),
         )
         self._create_context(simulation)
 
@@ -448,6 +446,10 @@ class HP:
         for _ in range(self.config.sphere_hot_blocks):
             self._run_block(simulation)
             self._record_rg(simulation)
+        simulation.saveStructure(
+            fileName=str(self.config.output_folder / "1.collapse_initial.gro"),
+            mode="gro",
+        )
 
         simulation.integrator.setTemperature(1.0 / 0.008314)
         simulation.addAdditionalForce(
@@ -476,16 +478,32 @@ class HP:
                 simulation.context.setParameter("r_sphere", current_radius)
                 previous_radius = current_radius
 
-        simulation.saveStructure(fileName="1.sphere-collapse_final.gro", mode="gro")
+        simulation.saveStructure(fileName=str(self._collapsed_structure), mode="gro")
+
+        # Stage 2: retain the sphere-collapse forces (including the
+        # unknotted-only ideal-chromosome term) and replace spherical
+        # confinement with type-to-type interactions for equilibration.
         simulation.removeForce("SphericalConfinement")
         simulation.addAdditionalForce(simulation.addTypetoType)
-        self._configure_trajectory(simulation, save_every_blocks=250)
         for _ in range(self.config.equilibration_time):
             self._run_block(simulation)
             self._record_rg(simulation)
+        simulation.saveStructure(
+            fileName=str(self._equilibration_output_structure), mode="gro"
+        )
 
+        # Stage 3: generate the production trajectory from the equilibrated
+        # spherical-collapse state using the existing production block count.
+        simulation.name = "3.production"
+        self._configure_trajectory(simulation, save_every_blocks=1)
+        for _ in range(self.config.production_blocks):
+            self._run_block(simulation)
+            self._record_rg(simulation)
         self._close_storage(simulation)
-        simulation.saveStructure(fileName="1.collapse_final.gro", mode="gro")
+        simulation.saveStructure(
+            fileName=str(self._production_final_structure), mode="gro"
+        )
+        self._finalize_stage_statistics(simulation)
         return simulation
 
     def _require_capsule_radius(self) -> float:
@@ -528,10 +546,10 @@ class HP:
             "equilibration": self.equilibrate,
             "production": self.production,
             "all_at_once": self.all_at_once,
+            "sphere_all_at_once": self.sphere_all_at_once,
             "expansion": self.expansion,
             "untie": self.untie,
             "capsule-collapse": self.capsule_collapse,
-            "sphere-collapse": self.sphere_collapse,
         }
         try:
             simulation = workflows[mode]()
@@ -547,20 +565,20 @@ def _parse_arguments() -> argparse.Namespace:
     parser.add_argument(
         "mode",
         choices=("collapse", "equilibration", "production", "all_at_once", "expansion",
-                 "untie", "capsule-collapse", "sphere-collapse"),
+                 "sphere_all_at_once", "untie", "capsule-collapse"),
     )
     parser.add_argument("output_folder", type=Path)
     parser.add_argument("chrom_sequence", type=Path)
     parser.add_argument("--model", choices=("knotted", "unknotted"), default="knotted")
-    parser.add_argument("--platform", default="OpenCL")
+    parser.add_argument("--platform", default="CPU")
     parser.add_argument("--equilibration-time", type=int, default=5000,
                         help="Number of equilibration blocks (default: 5000).")
     parser.add_argument("--equilibrated-structure", type=Path,
                         help="Single equilibrated GRO or NDB structure for expansion and capsule modes.")
     parser.add_argument("--types-table-dir", type=Path)
     parser.add_argument("--capsule-radius", type=float)
-    parser.add_argument("--sphere-radius", type=float,
-                        help="Target radius used by the sphere-collapse schedule.")
+    parser.add_argument("--sphere-radius", type=float, default=20.0,
+                        help="Target radius for sphere_all_at_once (default: 20.0).")
     return parser.parse_args()
 
 
