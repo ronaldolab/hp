@@ -1387,7 +1387,7 @@ class MiChroM:
             traj (bool, optional):
                 If `True`, attaches a reporter to save trajectory data during the simulation.
                 (Default: `False`)
-            file_name (str, optional):
+            outputName (str, optional):
                 The file name for saving trajectory data. If `None`, defaults to `self.name`.
                 (Default: `None`)
             trajFormat (str, optional):
@@ -2462,5 +2462,7 @@ class MiChroM:
         print('')
         print('{:^96s}'.format("Copyright (c) 2024, The OpenMiChroM development team at"))
         print('{:^96s}'.format("Rice University"))
+        print('{:^96s}'.format("***************************************************************************************"))
+        print('{:^96s}'.format("Modified version for the HP model."))
         print('{:^96s}'.format("***************************************************************************************"))
         stdout.flush()

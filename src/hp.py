@@ -1,6 +1,6 @@
 """HP chromosome-simulation workflows using OpenMiChroM 1.1.1.
 
-This module consolidates the legacy equilibration, expansion, and capsule
+This module consolidates the equilibration, expansion, and capsule
 workflows.  It deliberately preserves their force parameters and block counts;
 only the OpenMiChroM 1.1.1 keyword names have been updated.
 """
@@ -23,7 +23,7 @@ _OPENMICROM_SOURCE_ROOT = Path(__file__).resolve().parent / "OpenMiChroM"
 if (_OPENMICROM_SOURCE_ROOT / "OpenMiChroM" / "__init__.py").is_file():
     sys.path.insert(0, str(_OPENMICROM_SOURCE_ROOT))
 
-from OpenMiChroM.ChromDynamics import MiChroM
+from OpenMiChroM.ChromDynamics import MiChroM  # noqa: I001
 
 
 Model = Literal["knotted", "unknotted"]
@@ -40,7 +40,7 @@ class HPConfig:
     chrom_sequence: Path
     model: Model = "knotted"
     platform: str = "OpenCL"
-    blocks: int = 3000
+    blocks: int = 1000 #3000
     time_step: float = 0.01
     equilibration_time: int = 5000
     equilibrated_structure: Path | None = None
@@ -75,7 +75,10 @@ class HP:
     radius_of_gyration: list[float] = field(default_factory=list, init=False)
 
     def __post_init__(self) -> None:
-        self.config.output_folder = Path(self.config.output_folder)
+        # OpenMiChroM prefixes explicit structure filenames with its output
+        # folder.  Keep this path absolute so a relative folder is not added
+        # twice when those filenames are generated.
+        self.config.output_folder = Path(self.config.output_folder).expanduser().resolve()
         self.config.chrom_sequence = Path(self.config.chrom_sequence)
         if self.config.model not in {"knotted", "unknotted"}:
             raise ValueError("model must be 'knotted' or 'unknotted'")
@@ -132,10 +135,20 @@ class HP:
     ) -> None:
         """Attach the OpenMiChroM 1.1.1 CNDB trajectory reporter."""
         simulation.createReporters(
-            statistics=False,
+            statistics=True,
             traj=True,
             trajFormat="cndb",
             outputName="traj",
+            interval=self.config.blocks * save_every_blocks,
+        )
+
+    def _configure_statistics(
+        self, simulation: MiChroM, save_every_blocks: int = 1
+    ) -> None:
+        """Attach a statistics reporter without writing a trajectory."""
+        simulation.createReporters(
+            statistics=True,
+            traj=False,
             interval=self.config.blocks * save_every_blocks,
         )
 
@@ -166,11 +179,15 @@ class HP:
 
     @property
     def _collapsed_structure(self) -> Path:
-        return self.config.output_folder / "1.collapse_0_block0.gro"
+        return self.config.output_folder / "1.collapse_final.gro"
 
     @property
     def _equilibration_output_structure(self) -> Path:
-        return self.config.output_folder / "2.equilibration_0_block0.gro"
+        return self.config.output_folder / "2.equilibration_final.gro"
+
+    @property
+    def _production_final_structure(self) -> Path:
+        return self.config.output_folder / "3.production_final.gro"
 
     def _record_rg(self, simulation: MiChroM) -> None:
         positions = simulation.getPositions()
@@ -232,11 +249,13 @@ class HP:
             flat_bottom=True, type_to_type=True,
         )
         self._create_context(simulation)
+        self._configure_statistics(simulation)
         simulation.saveStructure(fileName="1.collapse_initial.gro", mode="gro")
         for _ in range(self.config.collapse_blocks):
             self._run_block(simulation)
             self._record_rg(simulation)
         simulation.saveStructure(fileName=str(self._collapsed_structure), mode="gro")
+        self._finalize_stage_statistics(simulation)
         return simulation
 
     def equilibrate(self, structure_file: Path | None = None) -> MiChroM:
@@ -249,18 +268,20 @@ class HP:
             flat_bottom=True, type_to_type=True,
         )
         self._create_context(simulation)
+        self._configure_statistics(simulation)
         for _ in range(self.config.equilibration_time):
             self._run_block(simulation)
             self._record_rg(simulation)
         simulation.saveStructure(
             fileName=str(self._equilibration_output_structure), mode="gro"
         )
+        self._finalize_stage_statistics(simulation)
         return simulation
 
     def production(self, structure_file: Path | None = None) -> MiChroM:
         """Run the unconstrained 200-block production simulation."""
         source = structure_file or self._equilibration_output_structure
-        simulation = self._new_simulation("3.simulation", self._temperature)
+        simulation = self._new_simulation("3.production", self._temperature)
         self._load_structure(simulation, Path(source))
         self._add_polymer_forces(
             simulation, repulsive_cutoff=self._repulsive_cutoff, type_to_type=True
@@ -271,7 +292,10 @@ class HP:
             self._run_block(simulation)
             self._record_rg(simulation)
         self._close_storage(simulation)
-        simulation.saveStructure(mode="gro")
+        simulation.saveStructure(
+            fileName=str(self._production_final_structure), mode="gro"
+        )
+        self._finalize_stage_statistics(simulation)
         return simulation
 
     def all_at_once(self) -> MiChroM:
@@ -286,13 +310,13 @@ class HP:
         if self.config.expansion_blocks <= self.config.expansion_start_block:
             raise ValueError("expansion_blocks must exceed expansion_start_block")
         source = self._equilibrated_structure()
-        simulation = self._new_simulation("3.simulation", self._temperature)
+        simulation = self._new_simulation("3.expansion", self._temperature)
         self._load_structure(simulation, source)
         self._add_polymer_forces(
             simulation, repulsive_cutoff=100.0, type_to_type=True
         )
         self._create_context(simulation)
-        simulation.saveStructure(fileName="3.simulation_initial.gro", mode="gro")
+        simulation.saveStructure(fileName="3.expansion_initial.gro", mode="gro")
         self._configure_trajectory(simulation, save_every_blocks=10)
 
         total_expansion_blocks = (
@@ -330,14 +354,14 @@ class HP:
     def untie(self) -> MiChroM:
         """Run the capsule-confined, ideal-chromosome untying workflow."""
         radius = self._require_capsule_radius()
-        simulation = self._new_simulation("3.simulation", temperature=1.0)
+        simulation = self._new_simulation("3.untie", temperature=1.0)
         self._load_structure(simulation, self._equilibrated_structure())
         self._add_polymer_forces(
             simulation, repulsive_cutoff=3.0, ideal_chromosome=True,
             capsule=(radius, radius, self.config.capsule_force_constant),
         )
         self._create_context(simulation)
-        simulation.saveStructure(fileName="3.simulation_initial.gro", mode="gro")
+        simulation.saveStructure(fileName="3.untie_initial.gro", mode="gro")
         self._configure_trajectory(simulation, save_every_blocks=10)
         for current_block in range(self.config.untie_blocks):
             self._run_block(simulation)
@@ -356,14 +380,14 @@ class HP:
         reached.  No units or schedule values are changed here.
         """
         target_radius = self._require_capsule_radius()
-        simulation = self._new_simulation("3.simulation", temperature=1.0)
+        simulation = self._new_simulation("3.capsule_collapse", temperature=1.0)
         self._load_structure(simulation, self._equilibrated_structure())
         self._add_polymer_forces(
             simulation, repulsive_cutoff=self._repulsive_cutoff,
             capsule=(21.2, 21.2, self.config.capsule_force_constant),
         )
         self._create_context(simulation)
-        simulation.saveStructure(fileName="3.simulation_initial.gro", mode="gro")
+        simulation.saveStructure(fileName="3.capsule_collapse_initial.gro", mode="gro")
 
         radius_schedule = 10.4 + (21.2 - 10.4) * np.exp(-np.linspace(0, 4, 50))
         previous_radius: float | None = None
@@ -395,10 +419,10 @@ class HP:
         return simulation
 
     def sphere_collapse(self) -> MiChroM:
-        """Run the legacy hot-expansion and spherical-collapse protocol.
+        """Run the hot-expansion and spherical-collapse protocol.
 
         The protocol starts from a spring spiral, expands for 500 blocks at
-        ``T = 3.0``, compresses from radius 600.0 using the legacy exponential
+        ``T = 3.0``, compresses from radius 600.0 using the exponential
         schedule, and then equilibrates with type-to-type interactions.  The
         sphere radius and every numerical schedule parameter remain in the
         OpenMiChroM units used by the archived sphere protocol.
@@ -461,7 +485,7 @@ class HP:
             self._record_rg(simulation)
 
         self._close_storage(simulation)
-        simulation.saveStructure(fileName="1.sphere-collapse_equilibrated.gro", mode="gro")
+        simulation.saveStructure(fileName="1.collapse_final.gro", mode="gro")
         return simulation
 
     def _require_capsule_radius(self) -> float:
@@ -481,6 +505,21 @@ class HP:
         output_path = self.config.output_folder / "Rg.data"
         np.savetxt(output_path, self.radius_of_gyration)
         return output_path
+
+    def _finalize_stage_statistics(self, simulation: MiChroM) -> list[Path]:
+        """Rename the shared OpenMiChroM statistics files after one stage."""
+        renamed_paths: list[Path] = []
+        for filename in ("initialStats.txt", "statistics.txt"):
+            source_path = self.config.output_folder / filename
+            if not source_path.is_file():
+                continue
+
+            destination_path = (
+                self.config.output_folder / f"{simulation.name}_{filename}"
+            )
+            source_path.rename(destination_path)
+            renamed_paths.append(destination_path)
+        return renamed_paths
 
     def run(self, mode: str) -> MiChroM:
         """Run one named workflow and write its accumulated Rg values."""
