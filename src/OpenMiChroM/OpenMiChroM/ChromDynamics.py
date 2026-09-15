@@ -1244,6 +1244,21 @@ class MiChroM:
                 raise ValueError("Force function added multiple new forces in MiChroM! Please break down the function so each force is added separately.")
         
         force = self.forceDict[newForceDictKey]
+
+        # Match the nonbonded method assigned in ``createSimulation`` for
+        # forces present at context creation. OpenMM requires all nonbonded
+        # forces in one system to agree on cutoff use; without this setting, a
+        # CustomNonbondedForce added after initialization defaults to NoCutoff.
+        if hasattr(force, "CutoffNonPeriodic") and hasattr(force, "CutoffPeriodic"):
+            force.setNonbondedMethod(force.CutoffNonPeriodic)
+
+        # Apply the same bonded-neighbor exclusions used for forces present at
+        # context creation. OpenMM requires all CustomNonbondedForce objects
+        # in a system to have identical exclusions.
+        exceptions = getattr(self, "bondsForException", [])
+        if exceptions and hasattr(force, "addExclusion"):
+            for pair in {tuple(sorted(bond)) for bond in exceptions}:
+                force.addExclusion(int(pair[0]), int(pair[1]))
        
         # add the force
         print("adding force ", newForceDictKey, self.system.addForce(self.forceDict[newForceDictKey]))

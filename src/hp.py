@@ -54,9 +54,9 @@ class HPConfig:
     untie_blocks: int = 12000
     capsule_relaxation_blocks: int = 2000
     capsule_production_blocks: int = 12000
-    sphere_hot_blocks: int = 500
-    sphere_relaxation_blocks: int = 5000
-    sphere_schedule_steps: int = 500
+    sphere_hot_blocks: int = 100 #500
+    sphere_relaxation_blocks: int = 100 #5000
+    sphere_schedule_steps: int = 10 #500
 
 
 @dataclass
