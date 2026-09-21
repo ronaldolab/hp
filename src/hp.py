@@ -223,6 +223,8 @@ class HP:
         self._create_context(simulation)
         self._configure_statistics(simulation)
         simulation.saveStructure(fileName="1.collapse_initial.gro", mode="gro")
+
+        print("Collapsing structure")
         for _ in range(self.config.collapse_blocks):
             self._run_block(simulation)
             self._record_rg(simulation)
@@ -241,6 +243,8 @@ class HP:
         )
         self._create_context(simulation)
         self._configure_statistics(simulation)
+        
+        print("Equilibrating structure")
         for _ in range(self.config.equilibration_time):
             self._run_block(simulation)
             self._record_rg(simulation)
@@ -260,6 +264,8 @@ class HP:
         )
         self._create_context(simulation)
         self._configure_trajectory(simulation, save_every_blocks=1)
+
+        print("Running production simulation")
         for _ in range(self.config.production_blocks):
             self._run_block(simulation)
             self._record_rg(simulation)
@@ -279,8 +285,7 @@ class HP:
     def expansion(self) -> MiChroM:
         """Run the type-table expansion workflow.
 
-        The A1--A1 interaction follows the in-memory ramp.  The Context is never recreated while changing the ramp: all 
-        changes use global Context parameters.
+        The A1--A1 interaction follows the in-memory ramp.  The Context is never recreated while changing the ramp: all changes use global Context parameters.
         """
         source = self._equilibrated_structure()
         simulation = self._new_simulation("4.expansion", self._temperature)
@@ -288,13 +293,7 @@ class HP:
         self._add_polymer_forces(
             simulation, repulsive_cutoff=100.0
         )
-        # Both forces exist before Context creation.  Initially only the
-        # standard type-to-type interaction is active; it is switched off at
-        # the original ramp start without rebuilding the Context.
-        simulation.addTypetoType(
-            mu=3.22, rc=1.78,
-            energyScaleParameter="expansion_default_types_scale", energyScale=1.0,
-        )
+        # The expansion force is fully defined before Context creation.
         simulation.addExpansionTypes(mu=3.22, rc=1.78, initialA1=-2.68e-1)
         self._create_context(simulation)
         simulation.saveStructure(fileName="4.expansion_initial.gro", mode="gro")
@@ -303,21 +302,16 @@ class HP:
         a1_values = np.arange(-2.68e-1, 5.0 + 0.5e-3, 1e-3)
         change_interval = max(1, self.config.relaxation_blocks // len(a1_values))
 
+        print("Expanding structure")
         for current_block in range(self.config.relaxation_blocks):
-            self._run_block(simulation)
-            self._record_rg(simulation)
-
-            if current_block == 0:
-                print("Expanding structure")
-                simulation.context.setParameter("expansion_default_types_scale", 0.0)
-                simulation.context.setParameter("expansion_types_scale", 1.0)
-                simulation.context.setParameter("expansion_a1", float(a1_values[0]))
-            elif current_block % change_interval == 0:
+            if current_block % change_interval == 0:
                 table_index = current_block // change_interval
                 if table_index < len(a1_values):
                     simulation.context.setParameter(
                         "expansion_a1", float(a1_values[table_index])
                     )
+            self._run_block(simulation)
+            self._record_rg(simulation)
 
         self._close_storage(simulation)
         simulation.saveStructure(
@@ -336,12 +330,14 @@ class HP:
         )
         self._create_context(simulation)
         simulation.saveStructure(fileName="4.untie_initial.gro", mode="gro")
-        self._configure_trajectory(simulation, save_every_blocks=10)
+        self._configure_trajectory(simulation, save_every_blocks=1)
+
+        print("Untying structure")
         for current_block in range(self.config.untie_blocks):
             self._run_block(simulation)
             self._record_rg(simulation)
-            if current_block % 500 == 0:
-                simulation.saveStructure(mode="gro")
+            # if current_block % 500 == 0:
+            #     simulation.saveStructure(mode="gro")
         self._close_storage(simulation)
         simulation.saveStructure(
             fileName=str(self._untie_final_structure), mode="gro"
@@ -370,6 +366,8 @@ class HP:
         # The ideal-chromosome term is retained for the unknotted model, and the capsule confinement is applied to all models.
         radius_schedule = 10.4 + (21.2 - 10.4) * np.exp(-np.linspace(0, 4, 50))
         previous_radius: float | None = None
+
+        print("Collapsing structure into capsule")
         for current_block in range(self.config.relaxation_blocks):
             schedule_index = min(
                 int(current_block * len(radius_schedule) /
@@ -392,12 +390,15 @@ class HP:
         # Stage 2: Retain the ideal-chromosome term for the unknotted model, then equilibrate the system with the capsule confinement at the target radius. The type-to-type interactions are not used in this workflow.
         simulation.context.setParameter("r_conf", target_radius)
         simulation.context.setParameter("z_conf", target_radius)
+
+        print("Equilibrating structure in capsule")
         for _ in range(self.config.equilibration_time):
             self._run_block(simulation)
             self._record_rg(simulation)
         simulation.saveStructure(fileName=str(self._equilibration_final_structure), mode="gro")
 
         # Stage 3: generate the production trajectory from the collapsed capsule state using the existing production block count.
+        print("Running production simulation")
         simulation.name = "3.production"
         self._configure_trajectory(simulation, save_every_blocks=1)
         for current_block in range(self.config.production_blocks):
@@ -443,6 +444,8 @@ class HP:
         # and add spherical confinement for the compression.
         hot_temperature = 3.0
         simulation.integrator.setTemperature(hot_temperature / 0.008314)
+
+        print("Expanding structure at high temperature")
         for _ in range(self.config.sphere_hot_blocks):
             self._run_block(simulation)
             self._record_rg(simulation)
@@ -461,6 +464,8 @@ class HP:
             -np.linspace(0, 5, self.config.sphere_schedule_steps)
         )
         previous_radius: float | None = None
+
+        print("Collapsing structure into sphere")
         for current_block in range(self.config.relaxation_blocks):
             schedule_index = min(
                 int(current_block * len(radius_schedule) /
@@ -485,6 +490,8 @@ class HP:
         # confinement with type-to-type interactions for equilibration.
         simulation.removeForce("SphericalConfinement")
         simulation.addAdditionalForce(simulation.addTypetoType)
+
+        print("Equilibrating structure")
         for _ in range(self.config.equilibration_time):
             self._run_block(simulation)
             self._record_rg(simulation)
@@ -496,6 +503,8 @@ class HP:
         # spherical-collapse state using the existing production block count.
         simulation.name = "3.production"
         self._configure_trajectory(simulation, save_every_blocks=1)
+
+        print("Running production simulation")
         for _ in range(self.config.production_blocks):
             self._run_block(simulation)
             self._record_rg(simulation)
