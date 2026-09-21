@@ -37,7 +37,7 @@ class HPConfig:
     chrom_sequence: Path
     model: Model = "knotted"
     platform: str = "CPU"
-    blocks: int = 10 #1000 #3000
+    blocks: int = 3000
     time_step: float = 0.01
     equilibration_time: int = 5000
     equilibrated_structure: Path | None = None
