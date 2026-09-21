@@ -8,7 +8,6 @@ The HP simulation workflows use mostly OpenMiChroM 1.1.1 and OpenMM 8.3.1.
 from __future__ import annotations
 
 import argparse
-import re
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -38,25 +37,19 @@ class HPConfig:
     chrom_sequence: Path
     model: Model = "knotted"
     platform: str = "CPU"
-    blocks: int = 1000 #3000
+    blocks: int = 10 #1000 #3000
     time_step: float = 0.01
     equilibration_time: int = 5000
     equilibrated_structure: Path | None = None
-    types_table_dir: Path | None = None
-    capsule_radius: float | None = None
+    radius: float | None = None
     capsule_force_constant: float = 30.0
-    sphere_radius: float = 20.0
 
     collapse_blocks: int = 200
     production_blocks: int = 200
-    expansion_blocks: int = 5000
-    expansion_start_block: int = 100
+    relaxation_blocks: int = 5000
     untie_blocks: int = 12000
-    capsule_relaxation_blocks: int = 2000
-    capsule_production_blocks: int = 12000
-    sphere_hot_blocks: int = 100 #500
-    sphere_relaxation_blocks: int = 100 #5000
-    sphere_schedule_steps: int = 10 #500
+    sphere_hot_blocks: int = 500
+    sphere_schedule_steps: int = 500
 
 
 @dataclass
@@ -178,12 +171,21 @@ class HP:
         return self.config.output_folder / "1.collapse_final.gro"
 
     @property
-    def _equilibration_output_structure(self) -> Path:
+    def _equilibration_final_structure(self) -> Path:
         return self.config.output_folder / "2.equilibration_final.gro"
 
     @property
     def _production_final_structure(self) -> Path:
         return self.config.output_folder / "3.production_final.gro"
+
+    @property
+    def _expansion_final_structure(self) -> Path:
+        return self.config.output_folder / "4.expansion_final.gro"
+
+    @property
+    def _untie_final_structure(self) -> Path:
+        """Return the output path for the completed untying workflow."""
+        return self.config.output_folder / "4.untie_final.gro"
 
     def _record_rg(self, simulation: MiChroM) -> None:
         positions = simulation.getPositions()
@@ -204,32 +206,6 @@ class HP:
         if not structure.is_file():
             raise FileNotFoundError(f"Equilibrated structure does not exist: {structure}")
         return structure
-
-    @staticmethod
-    def _natural_sort_key(path: Path) -> list[object]:
-        return [int(item) if item.isdigit() else item.lower()
-                for item in re.split(r"(\d+)", path.name)]
-
-    def _type_tables(self) -> list[Path]:
-        directory = self.config.types_table_dir
-        if directory is None:
-            raise ValueError("types_table_dir is required for expansion")
-        directory = Path(directory)
-        if not directory.is_dir():
-            raise NotADirectoryError(f"Type-table directory does not exist: {directory}")
-        tables = sorted(
-            directory.glob("Michrom_repulsive_*.ff"), key=self._natural_sort_key
-        )
-        if not tables:
-            raise FileNotFoundError(f"No Michrom_repulsive_*.ff tables in {directory}")
-        return tables
-
-    def _change_custom_type(self, simulation: MiChroM, table: Path) -> None:
-        simulation.removeForce("CustomTypes")
-        simulation.addAdditionalForce(
-            simulation.addCustomTypes, mu=3.22, rc=1.78, TypesTable=str(table)
-        )
-        print(f"Changing to type table: {table.name}")
 
     def collapse(self) -> MiChroM:
         """Run the 200-block spring-spiral collapse stage."""
@@ -269,14 +245,14 @@ class HP:
             self._run_block(simulation)
             self._record_rg(simulation)
         simulation.saveStructure(
-            fileName=str(self._equilibration_output_structure), mode="gro"
+            fileName=str(self._equilibration_final_structure), mode="gro"
         )
         self._finalize_stage_statistics(simulation)
         return simulation
 
     def production(self, structure_file: Path | None = None) -> MiChroM:
         """Run the unconstrained 200-block production simulation."""
-        source = structure_file or self._equilibration_output_structure
+        source = structure_file or self._equilibration_final_structure
         simulation = self._new_simulation("3.production", self._temperature)
         self._load_structure(simulation, Path(source))
         self._add_polymer_forces(
@@ -301,63 +277,65 @@ class HP:
         return self.production()
 
     def expansion(self) -> MiChroM:
-        """Run the type-table expansion workflow."""
-        tables = self._type_tables()
-        if self.config.expansion_blocks <= self.config.expansion_start_block:
-            raise ValueError("expansion_blocks must exceed expansion_start_block")
+        """Run the type-table expansion workflow.
+
+        The A1--A1 interaction follows the in-memory ramp.  The Context is never recreated while changing the ramp: all 
+        changes use global Context parameters.
+        """
         source = self._equilibrated_structure()
-        simulation = self._new_simulation("3.expansion", self._temperature)
+        simulation = self._new_simulation("4.expansion", self._temperature)
         self._load_structure(simulation, source)
         self._add_polymer_forces(
-            simulation, repulsive_cutoff=100.0, type_to_type=True
+            simulation, repulsive_cutoff=100.0
         )
+        # Both forces exist before Context creation.  Initially only the
+        # standard type-to-type interaction is active; it is switched off at
+        # the original ramp start without rebuilding the Context.
+        simulation.addTypetoType(
+            mu=3.22, rc=1.78,
+            energyScaleParameter="expansion_default_types_scale", energyScale=1.0,
+        )
+        simulation.addExpansionTypes(mu=3.22, rc=1.78, initialA1=-2.68e-1)
         self._create_context(simulation)
-        simulation.saveStructure(fileName="3.expansion_initial.gro", mode="gro")
-        self._configure_trajectory(simulation, save_every_blocks=10)
+        simulation.saveStructure(fileName="4.expansion_initial.gro", mode="gro")
+        self._configure_trajectory(simulation, save_every_blocks=1)
 
-        total_expansion_blocks = (
-            self.config.expansion_blocks - self.config.expansion_start_block
-        )
-        change_interval = total_expansion_blocks // len(tables)
-        if change_interval < 1:
-            raise ValueError("Expansion has fewer blocks than type tables")
+        a1_values = np.arange(-2.68e-1, 5.0 + 0.5e-3, 1e-3)
+        change_interval = max(1, self.config.relaxation_blocks // len(a1_values))
 
-        for current_block in range(self.config.expansion_blocks):
+        for current_block in range(self.config.relaxation_blocks):
             self._run_block(simulation)
             self._record_rg(simulation)
-            if current_block % 500 == 0:
-                simulation.saveStructure(mode="gro")
 
-            if current_block == self.config.expansion_start_block:
+            if current_block == 0:
                 print("Expanding structure")
-                simulation.removeForce("TypetoType")
-                simulation.addAdditionalForce(
-                    simulation.addCustomTypes, mu=3.22, rc=1.78,
-                    TypesTable=str(tables[0]),
-                )
-                print(f"Changing to type table: {tables[0].name}")
-            elif current_block > self.config.expansion_start_block:
-                elapsed = current_block - self.config.expansion_start_block
-                if elapsed % change_interval == 0:
-                    table_index = elapsed // change_interval
-                    if table_index < len(tables):
-                        self._change_custom_type(simulation, tables[table_index])
+                simulation.context.setParameter("expansion_default_types_scale", 0.0)
+                simulation.context.setParameter("expansion_types_scale", 1.0)
+                simulation.context.setParameter("expansion_a1", float(a1_values[0]))
+            elif current_block % change_interval == 0:
+                table_index = current_block // change_interval
+                if table_index < len(a1_values):
+                    simulation.context.setParameter(
+                        "expansion_a1", float(a1_values[table_index])
+                    )
 
         self._close_storage(simulation)
-        simulation.saveStructure(mode="gro")
+        simulation.saveStructure(
+            fileName=str(self._expansion_final_structure), mode="gro"
+        )
         return simulation
 
     def untie(self) -> MiChroM:
         """Run the capsule-confined, ideal-chromosome untying workflow."""
         radius = self._require_capsule_radius()
-        simulation = self._new_simulation("3.untie", temperature=1.0)
+        simulation = self._new_simulation("4.untie", temperature=1.0)
         self._load_structure(simulation, self._equilibrated_structure())
         self._add_polymer_forces(
             simulation, repulsive_cutoff=3.0, ideal_chromosome=True,
             capsule=(radius, radius, self.config.capsule_force_constant),
         )
         self._create_context(simulation)
-        simulation.saveStructure(fileName="3.untie_initial.gro", mode="gro")
+        simulation.saveStructure(fileName="4.untie_initial.gro", mode="gro")
         self._configure_trajectory(simulation, save_every_blocks=10)
         for current_block in range(self.config.untie_blocks):
             self._run_block(simulation)
@@ -365,7 +343,9 @@ class HP:
             if current_block % 500 == 0:
                 simulation.saveStructure(mode="gro")
         self._close_storage(simulation)
-        simulation.saveStructure(mode="gro")
+        simulation.saveStructure(
+            fileName=str(self._untie_final_structure), mode="gro"
+        )
         return simulation
 
     def capsule_collapse(self) -> MiChroM:
@@ -374,21 +354,26 @@ class HP:
         The capsule radius follows the existing exponential schedule from 21.2 to 10.4, stopping the relaxation once the configured target radius is reached. No units or schedule values are changed here.
         """
         target_radius = self._require_capsule_radius()
-        simulation = self._new_simulation("3.capsule_collapse", temperature=1.0)
+        simulation = self._new_simulation("1.collapse", temperature=1.0)
         self._load_structure(simulation, self._equilibrated_structure())
         self._add_polymer_forces(
-            simulation, repulsive_cutoff=self._repulsive_cutoff,
+            simulation, 
+            repulsive_cutoff=self._repulsive_cutoff,
+            # The ideal-chromosome term is part of the unknotted model only.
+            ideal_chromosome=(self.config.model == "unknotted"),
             capsule=(21.2, 21.2, self.config.capsule_force_constant),
         )
         self._create_context(simulation)
-        simulation.saveStructure(fileName="3.capsule_collapse_initial.gro", mode="gro")
+        simulation.saveStructure(fileName="1.collapse_initial.gro", mode="gro")
 
+        # Stage 1: collapse the equilibrated structure into the shrinking capsule.
+        # The ideal-chromosome term is retained for the unknotted model, and the capsule confinement is applied to all models.
         radius_schedule = 10.4 + (21.2 - 10.4) * np.exp(-np.linspace(0, 4, 50))
         previous_radius: float | None = None
-        for current_block in range(self.config.capsule_relaxation_blocks):
+        for current_block in range(self.config.relaxation_blocks):
             schedule_index = min(
                 int(current_block * len(radius_schedule) /
-                    self.config.capsule_relaxation_blocks),
+                    self.config.relaxation_blocks),
                 len(radius_schedule) - 1,
             )
             current_radius = float(radius_schedule[schedule_index])
@@ -402,14 +387,26 @@ class HP:
                 simulation.context.setParameter("z_conf", current_radius)
                 previous_radius = current_radius
 
-        self._configure_trajectory(simulation, save_every_blocks=50)
-        for current_block in range(self.config.capsule_production_blocks):
+        simulation.saveStructure(fileName=str(self._collapsed_structure), mode="gro")
+
+        # Stage 2: Retain the ideal-chromosome term for the unknotted model, then equilibrate the system with the capsule confinement at the target radius. The type-to-type interactions are not used in this workflow.
+        simulation.context.setParameter("r_conf", target_radius)
+        simulation.context.setParameter("z_conf", target_radius)
+        for _ in range(self.config.equilibration_time):
             self._run_block(simulation)
             self._record_rg(simulation)
-            if current_block % 500 == 0:
-                simulation.saveStructure(mode="gro")
+        simulation.saveStructure(fileName=str(self._equilibration_final_structure), mode="gro")
+
+        # Stage 3: generate the production trajectory from the collapsed capsule state using the existing production block count.
+        simulation.name = "3.production"
+        self._configure_trajectory(simulation, save_every_blocks=1)
+        for current_block in range(self.config.production_blocks):
+            self._run_block(simulation)
+            self._record_rg(simulation)
         self._close_storage(simulation)
-        simulation.saveStructure(mode="gro")
+        simulation.saveStructure(
+                    fileName=str(self._production_final_structure), mode="gro"
+                )
         return simulation
 
     def sphere_all_at_once(self) -> MiChroM:
@@ -418,9 +415,10 @@ class HP:
         The first stage starts from a spring spiral, expands for 500 blocks at
         ``T = 3.0``, and compresses from radius 600.0 using the existing
         exponential schedule. After removing spherical confinement, the model
-        equilibrates with type-to-type interactions and then performs the
-        standard production length. The sphere radius and all schedule
-        parameters remain in the OpenMiChroM units used by this protocol.
+        equilibrates with type-to-type interactions to maintain the collapse, 
+        and then performs the standard production length. The sphere radius 
+        and all schedule parameters remain in the OpenMiChroM units used by 
+        this protocol.
         """
         target_radius = self._require_sphere_radius()
         if not self.config.chrom_sequence.is_file():
@@ -435,12 +433,14 @@ class HP:
             simulation,
             repulsive_cutoff=self._repulsive_cutoff,
             # The ideal-chromosome term is part of the unknotted model only.
-            # The knotted branch retains the same spherical-collapse schedule
-            # without this lengthwise interaction.
             ideal_chromosome=(self.config.model == "unknotted"),
         )
         self._create_context(simulation)
 
+        # Stage 1: expand the spring spiral at high temperature, 
+        # then compress into a sphere. We retain the hp 
+        # forces (including the unknotted-only ideal-chromosome term) 
+        # and add spherical confinement for the compression.
         hot_temperature = 3.0
         simulation.integrator.setTemperature(hot_temperature / 0.008314)
         for _ in range(self.config.sphere_hot_blocks):
@@ -461,10 +461,10 @@ class HP:
             -np.linspace(0, 5, self.config.sphere_schedule_steps)
         )
         previous_radius: float | None = None
-        for current_block in range(self.config.sphere_relaxation_blocks):
+        for current_block in range(self.config.relaxation_blocks):
             schedule_index = min(
                 int(current_block * len(radius_schedule) /
-                    self.config.sphere_relaxation_blocks),
+                    self.config.relaxation_blocks),
                 len(radius_schedule) - 1,
             )
             current_radius = float(radius_schedule[schedule_index])
@@ -480,7 +480,7 @@ class HP:
 
         simulation.saveStructure(fileName=str(self._collapsed_structure), mode="gro")
 
-        # Stage 2: retain the sphere-collapse forces (including the
+        # Stage 2: retain the hp forces (including the
         # unknotted-only ideal-chromosome term) and replace spherical
         # confinement with type-to-type interactions for equilibration.
         simulation.removeForce("SphericalConfinement")
@@ -489,7 +489,7 @@ class HP:
             self._run_block(simulation)
             self._record_rg(simulation)
         simulation.saveStructure(
-            fileName=str(self._equilibration_output_structure), mode="gro"
+            fileName=str(self._equilibration_final_structure), mode="gro"
         )
 
         # Stage 3: generate the production trajectory from the equilibrated
@@ -507,15 +507,15 @@ class HP:
         return simulation
 
     def _require_capsule_radius(self) -> float:
-        radius = self.config.capsule_radius
+        radius = self.config.radius if self.config.radius is not None else 20.0
         if radius is None or radius <= 0:
-            raise ValueError("capsule_radius must be a positive value")
+            raise ValueError("radius must be a positive value")
         return radius
 
     def _require_sphere_radius(self) -> float:
-        radius = self.config.sphere_radius
+        radius = self.config.radius if self.config.radius is not None else 20.0
         if radius is None or radius <= 0:
-            raise ValueError("sphere_radius must be a positive value")
+            raise ValueError("radius must be a positive value")
         return radius
 
     def save_radius_of_gyration(self) -> Path:
@@ -575,10 +575,8 @@ def _parse_arguments() -> argparse.Namespace:
                         help="Number of equilibration blocks (default: 5000).")
     parser.add_argument("--equilibrated-structure", type=Path,
                         help="Single equilibrated GRO or NDB structure for expansion and capsule modes.")
-    parser.add_argument("--types-table-dir", type=Path)
-    parser.add_argument("--capsule-radius", type=float)
-    parser.add_argument("--sphere-radius", type=float, default=20.0,
-                        help="Target radius for sphere_all_at_once (default: 20.0).")
+    parser.add_argument("--radius", type=float,
+                        help="Target radius for capsule and sphere workflows (default: 20.0 for sphere).")
     return parser.parse_args()
 
 
@@ -591,8 +589,6 @@ if __name__ == "__main__":
         platform=arguments.platform,
         equilibration_time=arguments.equilibration_time,
         equilibrated_structure=arguments.equilibrated_structure,
-        types_table_dir=arguments.types_table_dir,
-        capsule_radius=arguments.capsule_radius,
-        sphere_radius=arguments.sphere_radius,
-    )
+        radius=arguments.radius,
+        )
     HP(configuration).run(arguments.mode)

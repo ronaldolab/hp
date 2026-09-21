@@ -677,7 +677,8 @@ class MiChroM:
         self.forceDict["RepulsiveSoftCore"] = repulForce
 
         
-    def addTypetoType(self, mu=3.22, rc = 1.78 ):
+    def addTypetoType(self, mu=3.22, rc = 1.78, energyScaleParameter=None,
+                      energyScale=1.0):
         R"""
         Adds the type-to-type interactions according to the MiChroM energy function parameters reported in "Di Pierro, M., Zhang, B., Aiden, E.L., Wolynes, P.G. and Onuchic, J.N., 2016. Transferable model for chromosome architecture. Proceedings of the National Academy of Sciences, 113(43), pp.12168-12173". 
         
@@ -695,10 +696,15 @@ class MiChroM:
         pt = os.path.dirname(os.path.realpath(__file__))
         filepath = os.path.join(pt,path)
 
-        self.addCustomTypes(name="TypetoType", mu=mu, rc=rc, TypesTable=filepath)
+        self.addCustomTypes(
+            name="TypetoType", mu=mu, rc=rc, TypesTable=filepath,
+            energyScaleParameter=energyScaleParameter, energyScale=energyScale,
+        )
         
 
-    def addCustomTypes(self, name="CustomTypes", mu=3.22, rc = 1.78, TypesTable=None,CutoffDistance=3.0):
+    def addCustomTypes(self, name="CustomTypes", mu=3.22, rc = 1.78,
+                       TypesTable=None, CutoffDistance=3.0,
+                       energyScaleParameter=None, energyScale=1.0):
         R"""
         Adds the type-to-type potential using custom values for interactions between the chromatin types. The parameters :math:`\mu` (mu) and rc are part of the probability of crosslink function :math:`f(r_{i,j}) = \frac{1}{2}\left( 1 + tanh\left[\mu(r_c - r_{i,j}\right] \right)`, where :math:`r_{i,j}` is the spatial distance between loci (beads) *i* and *j*.
         
@@ -732,12 +738,16 @@ class MiChroM:
             raise ValueError("Chromatin sequence not defined!")
 
         energy = "mapType(t1,t2)*0.5*(1. + tanh(mu*(rc - r)))*step(r-lim)"
+        if energyScaleParameter is not None:
+            energy = "{0}*({1})".format(energyScaleParameter, energy)
         
         crossLP = self.mm.CustomNonbondedForce(energy)
     
         crossLP.addGlobalParameter('mu', mu)
         crossLP.addGlobalParameter('rc', rc)
         crossLP.addGlobalParameter('lim', 1.0)
+        if energyScaleParameter is not None:
+            crossLP.addGlobalParameter(energyScaleParameter, energyScale)
         crossLP.setCutoffDistance(CutoffDistance)
 
         tab = pd.read_csv(TypesTable, sep=None, engine='python')
@@ -766,6 +776,67 @@ class MiChroM:
             crossLP.addParticle(value)
                 
         self.forceDict[name] = crossLP
+
+
+    def addExpansionTypes(self, mu=3.22, rc=1.78, initialA1=-2.68e-1,
+                          scale=0.0):
+        R"""Add the in-memory type-force ramp used by the HP expansion protocol.
+
+        This is the exact matrix template from ``create_decreasing_types.py``.
+        Its only ramped value is the A1--A1 interaction.  The table is created
+        once, before the OpenMM Context exists; subsequent ramp values are
+        supplied by the ``expansion_a1`` Context parameter.
+
+        The added energy, in the existing reduced MiChroM energy units, is
+        ``scale * (lambda(t1, t2) + (A1 - initialA1) delta(t1) delta(t2))
+        * f(r)``.  Here ``f(r)`` is the same tanh contact function used by
+        ``addCustomTypes``.  The A1 type index is zero by construction from
+        the fixed table header, so only the A1--A1 coefficient changes.
+        """
+        header_types = ("A1", "A2", "B1", "B2", "B3", "B4", "NA")
+        if not set(self.diff_types).issubset(set(header_types)):
+            missing_types = [
+                chromatin_type for chromatin_type in self.diff_types
+                if chromatin_type not in header_types
+            ]
+            raise ValueError(
+                "Types: {} are not present in the expansion type table".format(
+                    missing_types
+                )
+            )
+
+        type_matrix = np.array([
+            [initialA1, -2.75e-1, -2.63e-1, -2.59e-1, -2.67e-1, -2.67e-1, -2.26e-1],
+            [-2.75e-1, -2.99e-1, -2.87e-1, -2.81e-1, -3.01e-1, -3.01e-1, -2.45e-1],
+            [-2.63e-1, -2.87e-1, -3.42e-1, -3.22e-1, -3.37e-1, -3.37e-1, -2.10e-1],
+            [-2.59e-1, -2.81e-1, -3.22e-1, -3.30e-1, -3.29e-1, -3.29e-1, -2.83e-1],
+            [-2.67e-1, -3.01e-1, -3.37e-1, -3.29e-1, -3.41e-1, -3.41e-1, -3.49e-1],
+            [-2.67e-1, -3.01e-1, -3.37e-1, -3.29e-1, -3.41e-1, -3.41e-1, -3.49e-1],
+            [-2.26e-1, -2.45e-1, -2.10e-1, -2.83e-1, -3.49e-1, -3.49e-1, -2.56e-1],
+        ])
+        energy = (
+            "expansion_types_scale*"
+            "(mapType(t1,t2) + (expansion_a1 - expansion_a1_initial)*"
+            "delta(t1)*delta(t2))*0.5*(1. + tanh(mu*(rc - r)))*step(r-lim)"
+        )
+        expansion_force = self.mm.CustomNonbondedForce(energy)
+        expansion_force.addGlobalParameter("mu", mu)
+        expansion_force.addGlobalParameter("rc", rc)
+        expansion_force.addGlobalParameter("lim", 1.0)
+        expansion_force.addGlobalParameter("expansion_types_scale", scale)
+        expansion_force.addGlobalParameter("expansion_a1", initialA1)
+        expansion_force.addGlobalParameter("expansion_a1_initial", initialA1)
+        expansion_force.setCutoffDistance(3.0)
+        expansion_force.addTabulatedFunction(
+            "mapType", self.mm.Discrete2DFunction(
+                len(header_types), len(header_types), list(np.ravel(type_matrix))
+            )
+        )
+        self._createTypeList(header_types)
+        expansion_force.addPerParticleParameter("t")
+        for type_index in self.type_list:
+            expansion_force.addParticle([float(type_index)])
+        self.forceDict["ExpansionTypes"] = expansion_force
     
 
     def _createTypeList(self, header_types):
